@@ -1,5 +1,7 @@
 use anyhow::{Context as _, Result, anyhow, bail};
 #[cfg(target_os = "macos")]
+use clash_verge_logging::{Type as LogType, logging};
+#[cfg(target_os = "macos")]
 use network_interface::{NetworkInterface, NetworkInterfaceConfig as _};
 use serde::{Deserialize, Serialize};
 use serde_yaml_ng::{Mapping, Value};
@@ -380,14 +382,27 @@ fn bind_claim(claim: &BindClaim) -> io::Result<Vec<Socket>> {
         // Hold every overlapping form while probing so they still report a conflict.
         let mut guard_addresses = if claim.address.is_unspecified() {
             NetworkInterface::show()
-                .unwrap_or_default()
+                .unwrap_or_else(|error| {
+                    // Without the interface list the wildcard guard shrinks to loopback, so say
+                    // so rather than silently probing less than the previous release did.
+                    logging!(
+                        warn,
+                        LogType::Network,
+                        "unable to enumerate interfaces while probing {}; \
+                         only loopback guards the wildcard claim: {error}",
+                        claim.socket_addr()
+                    );
+                    Vec::new()
+                })
                 .into_iter()
                 .flat_map(|interface| interface.addr)
                 .map(|address| address.ip())
                 .filter(|candidate| {
+                    // Link-local addresses are skipped on both families: they are the ones most
+                    // likely to vanish between this enumeration and the bind below.
                     candidate.is_ipv4() == claim.address.is_ipv4()
                         && match candidate {
-                            IpAddr::V4(address) => !address.is_unspecified(),
+                            IpAddr::V4(address) => !address.is_unspecified() && !address.is_link_local(),
                             IpAddr::V6(address) => !address.is_unspecified() && !address.is_unicast_link_local(),
                         }
                 })
@@ -409,12 +424,14 @@ fn bind_claim(claim: &BindClaim) -> io::Result<Vec<Socket>> {
         guard_addresses.sort_unstable();
         guard_addresses.dedup();
         for address in guard_addresses {
-            sockets.push(bind_socket(&BindClaim::new(
-                claim.name,
-                address,
-                claim.port,
-                claim.transport,
-            ))?);
+            match bind_socket(&BindClaim::new(claim.name, address, claim.port, claim.transport)) {
+                Ok(socket) => sockets.push(socket),
+                // Only a conflict is evidence. A guard address that went away between the
+                // enumeration above and this bind proves nothing about the claimed port, and
+                // reporting it would move and persist the port the caller asked to keep.
+                Err(error) if is_bind_conflict(&error) => return Err(error),
+                Err(_) => {}
+            }
         }
     }
 
@@ -524,6 +541,42 @@ mod tests {
 
     fn mapping(yaml: &str) -> anyhow::Result<Mapping> {
         Ok(serde_yaml_ng::from_str(yaml)?)
+    }
+
+    /// The wildcard claim reaches conflicts through the enumerated interface guards, which the
+    /// loopback-only cases never exercise.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn probe_reports_interface_tcp_listener_conflicts_for_the_wildcard_address() -> anyhow::Result<()> {
+        use network_interface::{NetworkInterface, NetworkInterfaceConfig as _};
+        use std::net::IpAddr;
+
+        let Some(address) = NetworkInterface::show()?
+            .into_iter()
+            .flat_map(|interface| interface.addr)
+            .map(|address| address.ip())
+            .find(|address| match address {
+                IpAddr::V4(address) => !address.is_loopback() && !address.is_unspecified() && !address.is_link_local(),
+                IpAddr::V6(_) => false,
+            })
+        else {
+            // A host with no routable IPv4 address cannot host this conflict.
+            return Ok(());
+        };
+
+        let listener = TcpListener::bind((address, 0))?;
+        let port = listener.local_addr()?.port();
+        assert_eq!(
+            probe_listener(&ListenerProbe {
+                address: format!("0.0.0.0:{port}"),
+                transports: vec![ListenerTransport::Tcp],
+            }),
+            ListenerProbeOutcome::Conflict {
+                port,
+                transport: ListenerTransport::Tcp
+            }
+        );
+        Ok(())
     }
 
     #[test]
